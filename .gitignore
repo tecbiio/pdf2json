@@ -5,3 +5,4 @@ __pycache__/
 templates/
 utils/api_key.txt
 config.json
+gen/

@@ -18,7 +18,6 @@ python invoice_parser.py chemin/vers/facture.pdf
 
 Options utiles :
 
-- `-o chemin/sortie.json` : ecrit le resultat dans un fichier
 - `--ndjson` : un JSON par ligne (NDJSON) plutot qu'une liste
 
 Le payload propose pour chaque ligne a la cle `payload` contient `description`, `quantity`, `unit_price` et `line_total` (si detectables). Toutes les colonnes brutes restent dans `columns` pour affiner ou mapper vers votre API.
@@ -34,9 +33,7 @@ python invoice_parser.py templates/facture.pdf --csv lignes.csv
 Ajoute un appel HTTP pour chaque reference afin de recuperer un identifiant (par exemple un id produit). L'URL peut contenir `{reference}` qui sera remplacee.
 
 ```bash
-python invoice_parser.py templates/facture.pdf --csv lignes.csv \
-  --lookup-url 'https://api.exemple.com/items?ref={reference}' \
-  --lookup-header 'Authorization=Bearer MON_TOKEN'
+python invoice_parser.py templates/facture.pdf --csv lignes.csv
 ```
 
 La colonne `lookup_id` apparaîtra dans le CSV et dans le JSON si l'appel retourne un `id` (ou un `data.id`, ou le `id` du premier element d'une liste JSON).
@@ -62,7 +59,7 @@ python invoice_parser.py templates/avoir.pdf   --template-type avoir   --csv lig
 ### Mise à jour de stock (PATCH)
 
 - Endpoint lu depuis `config.json` clé `update_product_stock_url` (exemple dans `config.example.json`).
-- Corps de requête similaire à `utils/update_product.json` : `stock` sera négatif pour une facture (décrément), positif pour un avoir (incrément), et `update_reason` est configurable.
+- Corps de requête similaire à `utils/update_product.json` : `stock` envoyé est calculé à partir du stock initial du produit (si présent dans le cache) + delta (facture = -qty, avoir = +qty). Si le stock initial est inconnu, on retombe sur l’ancien comportement (envoi de delta). `update_reason` est renseigné automatiquement avec le numéro de facture/avoir extrait du PDF (par ex. `F25045691`, `AVID_25004993`); il est possible de l’écraser via `--update-reason` si besoin.
 
 ```bash
 python invoice_parser.py templates/facture.pdf --template-type facture \
@@ -70,10 +67,11 @@ python invoice_parser.py templates/facture.pdf --template-type facture \
 ```
 
 Le script utilise l’`lookup_id` trouvé, ou la `reference` si pas d’ID, pour remplacer `{product_id}` dans l’URL. Le résultat du PATCH est indiqué dans `payload.stock_update`.
+- Lorsqu'on passe `--update-stock`, un log NDJSON est écrit dans `gen/update_stock.log` (ts, référence, lookup_id, delta, raison, numéro de facture/avoir, statut).
 
 ### Cache produits (évite trop d'appels)
 
 - Le script peut lister tous les produits et les mettre en cache local `.cache/products.json`.
 - Utilise `--refresh-products` pour forcer un refetch, sinon le cache est relu.
-- `--products-url` permet d'overrider l'URL de listing; sinon, on prend `products_url` ou `lookup_products_url` (sans param) de `config.json`.
+- L'URL de listing vient de `config.json` (`products_url` ou `lookup_products_url` sans param).
 - `--verbose-products` affiche les statuts/pages pour diagnostiquer.

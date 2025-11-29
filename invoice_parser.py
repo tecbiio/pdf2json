@@ -6,6 +6,7 @@ import json
 import math
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -233,7 +234,7 @@ def fetch_reference_id(
 def patch_stock(
     update_url_template: Optional[str],
     product_id: str,
-    delta: float,
+    new_stock: float,
     reason: str,
     headers: dict,
 ) -> bool:
@@ -241,7 +242,7 @@ def patch_stock(
     if not update_url_template:
         return False
     url = update_url_template.replace("{product_id}", str(product_id))
-    payload = {"stock": delta, "update_reason": reason}
+    payload = {"stock": new_stock, "update_reason": reason}
     try:
         resp = requests.patch(url, json=payload, headers=headers, timeout=15)
         resp.raise_for_status()
@@ -317,6 +318,27 @@ def load_update_url(config_path: Optional[Path]) -> Optional[str]:
     return None
 
 
+def extract_invoice_number(pdf_path: Path, template_type: str) -> Optional[str]:
+    """Extrait le numero de facture/avoir depuis la premiere page."""
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        return None
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            first_page = pdf.pages[0]
+            text = first_page.extract_text() or ""
+    except Exception:
+        return None
+
+    if template_type.lower() == "facture":
+        match = re.search(r"Facture\s+N[°º]?\s*([A-Z0-9_]+)", text, re.IGNORECASE)
+    else:
+        match = re.search(r"Avoir\s+N[°º]?\s*([A-Z0-9_]+)", text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
 def fetch_products_catalog(
     products_url: Optional[str],
     headers: dict,
@@ -339,13 +361,9 @@ def fetch_products_catalog(
     meta_data = {}
     try:
         meta_resp = requests.get(products_url, headers=headers, timeout=15)
-        if verbose:
-            print(f"[products] meta status={meta_resp.status_code}", file=sys.stderr)
         meta_data = meta_resp.json()
-    except Exception as exc:
-        if verbose:
-            print(f"[products] meta error: {exc}", file=sys.stderr)
-
+    except Exception:
+        meta_data = {}
     # Certaines API renvoient les infos dans meta_data['error']
     meta_block = meta_data.get("error") if isinstance(meta_data, dict) and "error" in meta_data else meta_data
 
@@ -368,27 +386,15 @@ def fetch_products_catalog(
             hdrs = dict(headers)
             hdrs.setdefault("page", str(page))  # certains endpoints demandent un header page
             resp = requests.get(products_url, headers=hdrs, params={"page": page}, timeout=15)
-            if verbose:
-                snippet = resp.text[:200].replace("\n", " ")
-                print(f"[products] page={page} status={resp.status_code} snippet={snippet}", file=sys.stderr)
             try:
                 data = resp.json()
-            except Exception as exc:
-                if verbose:
-                    print(f"[products] page={page} json error: {exc}", file=sys.stderr)
+            except Exception:
                 continue
             if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
                 products.extend(data["data"])
             elif isinstance(data, list):
                 products.extend(data)
-            elif isinstance(data, dict) and "error" in data:
-                if verbose:
-                    print(f"[products] page={page} error payload: {data.get('error')}", file=sys.stderr)
-            elif verbose:
-                print(f"[products] page={page} unexpected payload keys={list(data.keys()) if isinstance(data, dict) else type(data)}", file=sys.stderr)
-        except Exception as exc:
-            if verbose:
-                print(f"[products] page={page} request error: {exc}", file=sys.stderr)
+        except Exception:
             continue
 
     try:
@@ -401,14 +407,27 @@ def fetch_products_catalog(
 
 
 def build_product_index(products: List[dict]) -> dict:
-    """Construit un index {reference->id} en utilisant product_code/code."""
+    """Construit un index {reference-> {id, stock}}."""
     index = {}
     for p in products:
         code = p.get("product_code") or p.get("code") or p.get("reference")
         pid = p.get("id") or p.get("product_id")
         if code and pid:
-            index[str(code).strip()] = str(pid)
+            stock = p.get("stock")
+            if stock is None:
+                stock = p.get("quantity") or p.get("stock_quantity") or p.get("stock_level")
+            index[str(code).strip()] = {"id": str(pid), "stock": stock}
     return index
+
+
+def log_stock_event(log_path: Path, entry: dict) -> None:
+    """Append a JSON line into gen/ logs for stock updates."""
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def write_output(lines: Iterable[dict], output_path: Optional[Path], ndjson: bool) -> None:
@@ -465,12 +484,6 @@ def parse_args() -> argparse.Namespace:
         help="Type de template a utiliser (facture ou avoir).",
     )
     parser.add_argument(
-        "-o",
-        "--output",
-        type=Path,
-        help="Fichier de sortie (si absent, ecriture sur la console)",
-    )
-    parser.add_argument(
         "--ndjson",
         action="store_true",
         help="Ecrit un JSON par ligne (format NDJSON) plutot qu'une liste JSON.",
@@ -479,22 +492,6 @@ def parse_args() -> argparse.Namespace:
         "--csv",
         type=Path,
         help="Chemin d'un fichier CSV pour les lignes extraites (utile pour des tests).",
-    )
-    parser.add_argument(
-        "--lookup-url",
-        type=str,
-        help="Endpoint pour recuperer un ID a partir d'une reference. Exemple: https://api.exemple.com/items?ref={reference}",
-    )
-    parser.add_argument(
-        "--products-url",
-        type=str,
-        help="Endpoint pour lister tous les produits (utilise pour un cache local). Si absent, tente config products_url ou lookup_products_url sans param.",
-    )
-    parser.add_argument(
-        "--lookup-header",
-        action="append",
-        default=[],
-        help="Header additionnel pour l'appel lookup, format Cle=Valeur (repetable). Exemple: Authorization=Bearer TOKEN",
     )
     parser.add_argument(
         "--verbose-lookups",
@@ -546,15 +543,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    lookup_url = args.lookup_url or load_lookup_url(args.config)
-    products_url = args.products_url or load_products_url(args.config, lookup_url)
+    lookup_url = load_lookup_url(args.config)
+    products_url = load_products_url(args.config, lookup_url)
     update_url = load_update_url(args.config)
+    invoice_number = extract_invoice_number(args.pdf_path, args.template_type)
 
     headers: dict[str, str] = {}
-    for header in args.lookup_header:
-        if "=" in header:
-            key, val = header.split("=", 1)
-            headers[key.strip()] = val.strip()
 
     api_key = load_api_key(args.api_key_path)
     if api_key and "userApiKey" not in headers:
@@ -585,9 +579,13 @@ def main() -> None:
 
             # D'abord le cache local
             if product_index:
-                lookup_id = product_index.get(str(ref).strip())
-                if lookup_id and args.verbose_lookups:
-                    payload["lookup_status"] = "from_cache"
+                entry = product_index.get(str(ref).strip())
+                if entry:
+                    lookup_id = entry.get("id")
+                    if lookup_id and args.verbose_lookups:
+                        payload["lookup_status"] = "from_cache"
+                    if entry.get("stock") is not None:
+                        payload["initial_stock"] = entry.get("stock")
 
             # Ensuite appel réseau si pas trouvé et URL dispo
             if not lookup_id and lookup_url:
@@ -596,13 +594,12 @@ def main() -> None:
                     payload["lookup_status"] = status
                     if info:
                         payload["lookup_info"] = info
-                if args.verbose_lookups and status != "ok":
-                    print(f"[lookup] ref={ref} status={status} info={info}", file=sys.stderr)
 
             if lookup_id:
                 payload["lookup_id"] = lookup_id
 
     if args.update_stock and update_url:
+        log_path = Path("gen/update_stock.log")
         for line in lines:
             payload = line.get("payload", {})
             product_id = payload.get("lookup_id") or payload.get("reference")
@@ -610,16 +607,44 @@ def main() -> None:
             if qty is None:
                 continue
             delta = -abs(qty) if args.template_type == "facture" else abs(qty)
-            success = patch_stock(update_url, str(product_id), delta, args.update_reason, headers)
+            reason = invoice_number or args.update_reason
+            initial_stock = payload.get("initial_stock")
+            new_stock = None
+            if initial_stock is not None:
+                try:
+                    new_stock = float(initial_stock) + delta
+                except Exception:
+                    new_stock = None
+            if new_stock is None:
+                new_stock = delta  # fallback: ancien comportement
+
+            success = patch_stock(update_url, str(product_id), new_stock, reason, headers)
             if success:
-                payload["stock_update"] = {"delta": delta, "status": "patched"}
+                payload["stock_update"] = {"delta": delta, "new_stock": new_stock, "status": "patched"}
             else:
-                payload["stock_update"] = {"delta": delta, "status": "failed"}
+                payload["stock_update"] = {"delta": delta, "new_stock": new_stock, "status": "failed"}
+            if invoice_number:
+                payload["invoice_number"] = invoice_number
+            log_stock_event(
+                log_path,
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "reference": payload.get("reference"),
+                    "product_id": product_id,
+                    "lookup_id": payload.get("lookup_id"),
+                    "delta": delta,
+                    "reason": reason,
+                    "invoice_number": invoice_number,
+                    "initial_stock": initial_stock,
+                    "new_stock": new_stock,
+                    "status": payload["stock_update"]["status"],
+                },
+            )
 
     if args.csv:
         write_csv(lines, args.csv)
     else:
-        write_output(lines, args.output, args.ndjson)
+        write_output(lines, None, args.ndjson)
 
 
 if __name__ == "__main__":
