@@ -1,0 +1,4 @@
+{
+  "lookup_products_url": "https://api.exemple.com/products?product_code={reference}",
+  "update_product_stock_url": "https://api.exemple.com/products/{product_id}/stock"
+}
